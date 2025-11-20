@@ -70,10 +70,29 @@ def introspect_columns():
             return cur.fetchall()
 
 
-meta = introspect_columns()
-by_table_cols: Dict[str, List[str]] = {}
-for r in meta:
-    by_table_cols.setdefault(r["table_name"], []).append(r["column_name"])
+_schema_cache: Dict[str, List[str]] | None = None
+_roles_cache: Dict[str, Dict[str, str]] | None = None
+
+
+def load_schema_metadata() -> Dict[str, List[str]]:
+    """Lazy-load table/column metadata so import doesn't depend on DB availability."""
+
+    global _schema_cache
+    if _schema_cache is not None:
+        return _schema_cache
+
+    try:
+        meta = introspect_columns()
+    except Exception:
+        _schema_cache = {}
+        return _schema_cache
+
+    by_table_cols: Dict[str, List[str]] = {}
+    for r in meta:
+        by_table_cols.setdefault(r["table_name"], []).append(r["column_name"])
+
+    _schema_cache = by_table_cols
+    return _schema_cache
 
 MARKET_TABLES = [
     "saudimarketcompanies",
@@ -157,14 +176,23 @@ def infer_market_roles(by: Dict[str, List[str]]):
     }
 
 
-ROLES = {"client": infer_client_roles(by_table_cols), "market": infer_market_roles(by_table_cols)}
+def resolve_roles() -> Dict[str, Dict[str, str]]:
+    global _roles_cache
+    if _roles_cache is not None:
+        return _roles_cache
+
+    metadata = load_schema_metadata()
+    _roles_cache = {
+        "client": infer_client_roles(metadata),
+        "market": infer_market_roles(metadata),
+    }
+    return _roles_cache
 
 
 def describe_schema():
-    from textwrap import indent
-
     lines = []
     lines.append("Tables and columns:")
+    by_table_cols = load_schema_metadata()
     order = [
         t for t in MARKET_TABLES if t in by_table_cols
     ] + [t for t in CLIENT_TABLES if t in by_table_cols] + [
@@ -174,7 +202,8 @@ def describe_schema():
         lines.append(f"- {t}(" + ", ".join(by_table_cols[t]) + ")")
     lines.append("")
     lines.append("Roles:")
-    for k, v in ROLES.items():
+    roles = resolve_roles()
+    for k, v in roles.items():
         lines.append(f"- {k}:")
         for kk, vv in v.items():
             lines.append(f"    {kk}: {vv}")
