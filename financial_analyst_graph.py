@@ -303,18 +303,29 @@ def run_safe_query(sql: str, params: Dict[str, Any] | None = None):
 
         if not raw_params:
             return raw_sql, raw_params
-        if isinstance(raw_params, dict) and re.search(r"\$\d+", raw_sql):
-            keys = list(raw_params.keys())
-
-            def value_for_index(idx: int):
-                # Prefer matching key order, otherwise fall back to the first value
-                if 0 <= idx - 1 < len(keys):
-                    return raw_params[keys[idx - 1]]
-                return raw_params.get("client_company_id", next(iter(raw_params.values())))
-
+        if re.search(r"\$\d+", raw_sql):
             ordered_markers = [int(m) for m in re.findall(r"\$(\d+)", raw_sql)]
-            values = tuple(value_for_index(i) for i in ordered_markers)
-            return re.sub(r"\$\d+", "%s", raw_sql), values
+
+            if isinstance(raw_params, dict):
+                keys = list(raw_params.keys())
+
+                def value_for_index(idx: int):
+                    # Prefer matching key order, otherwise fall back to the first value
+                    if 0 <= idx - 1 < len(keys):
+                        return raw_params[keys[idx - 1]]
+                    return raw_params.get("client_company_id", next(iter(raw_params.values())))
+
+                values = tuple(value_for_index(i) for i in ordered_markers)
+                return re.sub(r"\$\d+", "%s", raw_sql), values
+
+            if isinstance(raw_params, (list, tuple)):
+                def value_for_index(idx: int):
+                    if 0 <= idx - 1 < len(raw_params):
+                        return raw_params[idx - 1]
+                    return raw_params[-1] if raw_params else None
+
+                values = tuple(value_for_index(i) for i in ordered_markers)
+                return re.sub(r"\$\d+", "%s", raw_sql), values
         return raw_sql, raw_params
 
     sql, exec_params = normalize_sql_params(sql, params)
