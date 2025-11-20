@@ -242,7 +242,9 @@ Task:
    - Filters on the given client_company_id for client data.
    - Joins to market tables when relevant.
    - Returns a tidy time series of quarterly metrics to support the question (e.g. revenue, operating income, margins, etc.).
-2. Provide parameters as a JSON object.
+2. Use **named parameters** in PostgreSQL format (e.g. `%(client_company_id)s`) instead of positional markers like `$1`.
+   - Always include a `params` JSON object whose keys match the named parameters you used.
+   - Do not emit `$1`, `$2`, etc.
 3. Provide a short explanation of what you are doing.
 
 Output strictly as JSON with keys:
@@ -295,9 +297,41 @@ def run_safe_query(sql: str, params: Dict[str, Any] | None = None):
         for x in ["DROP ", "DELETE ", "UPDATE ", "INSERT ", "ALTER ", "TRUNCATE ", "CREATE "]
     ):
         raise ValueError("Unsafe SQL blocked by guardrails")
+
+    def normalize_sql_params(raw_sql: str, raw_params: Dict[str, Any] | None):
+        """Translate positional placeholders ($1) into psycopg-friendly params."""
+
+        if not raw_params:
+            return raw_sql, raw_params
+        if re.search(r"\$\d+", raw_sql):
+            ordered_markers = [int(m) for m in re.findall(r"\$(\d+)", raw_sql)]
+
+            if isinstance(raw_params, dict):
+                keys = list(raw_params.keys())
+
+                def value_for_index(idx: int):
+                    # Prefer matching key order, otherwise fall back to the first value
+                    if 0 <= idx - 1 < len(keys):
+                        return raw_params[keys[idx - 1]]
+                    return raw_params.get("client_company_id", next(iter(raw_params.values())))
+
+                values = tuple(value_for_index(i) for i in ordered_markers)
+                return re.sub(r"\$\d+", "%s", raw_sql), values
+
+            if isinstance(raw_params, (list, tuple)):
+                def value_for_index(idx: int):
+                    if 0 <= idx - 1 < len(raw_params):
+                        return raw_params[idx - 1]
+                    return raw_params[-1] if raw_params else None
+
+                values = tuple(value_for_index(i) for i in ordered_markers)
+                return re.sub(r"\$\d+", "%s", raw_sql), values
+        return raw_sql, raw_params
+
+    sql, exec_params = normalize_sql_params(sql, params)
     with db_session() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql, params or {})
+            cur.execute(sql, exec_params or {})
             rows = cur.fetchall()
     # Basic normalization for JSON serialization
     def norm(v):
@@ -538,8 +572,15 @@ def node_build_sql(state: State) -> State:
         return state
 
     out = sql_llm_agent(state["user_query"], state["client_company_id"])
+    params = out.get("params")
+    if not isinstance(params, dict) or not params:
+        params = {"client_company_id": state["client_company_id"]}
+    else:
+        params = dict(params)
+        params.setdefault("client_company_id", state["client_company_id"])
+
     state["sql"] = out.get("sql", "")
-    state["params"] = out.get("params", {"client_company_id": state["client_company_id"]})
+    state["params"] = params
     return state
 
 
