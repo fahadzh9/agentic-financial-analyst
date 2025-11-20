@@ -561,8 +561,15 @@ def node_build_sql(state: State) -> State:
         return state
 
     out = sql_llm_agent(state["user_query"], state["client_company_id"])
+    params = out.get("params")
+    if not isinstance(params, dict) or not params:
+        params = {"client_company_id": state["client_company_id"]}
+    else:
+        params = dict(params)
+        params.setdefault("client_company_id", state["client_company_id"])
+
     state["sql"] = out.get("sql", "")
-    state["params"] = out.get("params", {"client_company_id": state["client_company_id"]})
+    state["params"] = params
     return state
 
 
