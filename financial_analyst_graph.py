@@ -3,7 +3,7 @@ import os
 # 🔑 Keys (set via env vars)
 os.environ["ANTHROPIC_API_KEY"] = os.getenv("ANTHROPIC_API_KEY", "")
 os.environ["TAVILY_API_KEY"] = os.getenv("TAVILY_API_KEY", "")
-
+print(os.environ["ANTHROPIC_API_KEY"])
 # 🤖 Models
 os.environ["CLAUDE_MODEL"] = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
 os.environ["STRATEGY_MODEL"] = os.getenv("STRATEGY_MODEL", "claude-sonnet-4-5-20250929")
