@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Any, Dict
 
-from financial_analyst_graph import ask  # uses the LangGraph app defined in the notebook
+from financial_analyst_graph import ask, diagnostics  # uses the LangGraph app defined in the notebook
 
 app = FastAPI(
     title="Agentic Financial Analyst Service",
@@ -27,6 +27,12 @@ class AskResponse(BaseModel):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+@app.get("/diagnostics")
+async def diagnostics_endpoint():
+    """Check environment variables, database connectivity, and LLM health."""
+    return diagnostics()
 
 
 @app.post("/ask")

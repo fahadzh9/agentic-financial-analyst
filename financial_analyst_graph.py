@@ -952,3 +952,54 @@ def render_provenance(out: dict):
         print("Strategy LLM (primary): (none)")
     if tr.get("strategy_user_prompt"):
         print("Strategy saw user prompt:", tr["strategy_user_prompt"])
+
+
+def diagnostics():
+    env_required = [
+        "ANTHROPIC_API_KEY",
+        "TAVILY_API_KEY",
+        "PGHOST",
+        "PGPORT",
+        "PGDATABASE",
+        "PGUSER",
+        "PGPASSWORD",
+    ]
+    env_status = {k: bool(os.getenv(k)) for k in env_required}
+
+    db_status: dict[str, Any]
+    try:
+        with db_session() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                _ = cur.fetchone()
+        db_status = {
+            "status": "ok",
+            "target": f"{PG['user']}@{PG['host']}:{PG['port']}/{PG['dbname']} ({PG['schema']})",
+        }
+    except Exception as e:  # noqa: BLE001
+        db_status = {"status": "error", "message": str(e)}
+
+    llm_status: dict[str, Any]
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    model = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
+    if not api_key:
+        llm_status = {"status": "error", "message": "ANTHROPIC_API_KEY is missing"}
+    else:
+        try:
+            client = Anthropic(api_key=api_key)
+            resp = client.messages.create(
+                model=model,
+                max_tokens=5,
+                messages=[{"role": "user", "content": "Reply with 'ok'"}],
+                system="You are a lightweight health check. Answer with 'ok'.",
+            )
+            reply = resp.content[0].text if resp.content else ""
+            llm_status = {"status": "ok", "model": model, "reply": reply}
+        except Exception as e:  # noqa: BLE001
+            llm_status = {"status": "error", "model": model, "message": str(e)}
+
+    return {
+        "environment": env_status,
+        "database": db_status,
+        "llm": llm_status,
+    }
