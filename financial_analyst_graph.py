@@ -553,7 +553,7 @@ class State(TypedDict, total=False):
 
 def node_build_sql(state: State) -> State:
     if not USE_SQL_LLM:
-        state["sql"] = """
+        sql = """
         SELECT
           ci.client_company_id,
           ci.year::INT AS year,
@@ -568,8 +568,8 @@ def node_build_sql(state: State) -> State:
         WHERE ci.client_company_id = %(client_company_id)s
         ORDER BY year, quarter;
         """.strip()
-        state["params"] = {"client_company_id": state["client_company_id"]}
-        return state
+        params = {"client_company_id": state["client_company_id"]}
+        return {"sql": sql, "params": params}
 
     out = sql_llm_agent(state["user_query"], state["client_company_id"])
     params = out.get("params")
@@ -579,31 +579,32 @@ def node_build_sql(state: State) -> State:
         params = dict(params)
         params.setdefault("client_company_id", state["client_company_id"])
 
-    state["sql"] = out.get("sql", "")
-    state["params"] = params
-    return state
+    return {
+        "sql": out.get("sql", ""),
+        "params": params,
+    }
+
 
 
 def node_run_sql(state: State) -> State:
     rows = run_safe_query(state["sql"], state.get("params") or {})
-    state["rows"] = rows
-    return state
+    return {"rows": rows}
+
 
 
 def node_health(state: State) -> State:
     rows = state.get("rows", [])
     if not rows:
-        state["health"] = {"status": "warning", "issues": ["No rows returned"], "notes": ""}
-        return state
+        return {"health": {"status": "warning", "issues": ["No rows returned"], "notes": ""}}
     h = health_llm_agent(rows)
-    state["health"] = h
-    return state
+    return {"health": h}
+
 
 
 def node_macro(state: State) -> State:
     m = macro_llm_agent(state.get("user_query", ""), state.get("sector_name"))
-    state["macro"] = m
-    return state
+    return {"macro": m}
+
 
 
 def build_narratives(rows: List[Dict[str, Any]], macro: Dict[str, Any]) -> tuple[str, str]:
@@ -635,24 +636,28 @@ def node_strategy(state: State) -> State:
         state.get("macro", {}),
         state.get("sector_name"),
     )
-    state["strategy"] = {
-        "stance": strat.get("stance"),
-        "actions": (strat.get("actions") or [])[:5],
-        "signals": strat.get("signals", {}),
+    return {
+        "strategy": {
+            "stance": strat.get("stance"),
+            "actions": (strat.get("actions") or [])[:5],
+            "signals": strat.get("signals", {}),
+        }
     }
-    return state
+
 
 
 def node_narrative(state: State) -> State:
     narrative_en, narrative_short = build_narratives(state.get("rows", []), state.get("macro", {}))
-    state["final_answer"] = narrative_en
-    state["short_answer"] = narrative_short
-    return state
+    return {
+        "final_answer": narrative_en,
+        "short_answer": narrative_short,
+    }
+
 
 
 def node_finish(state: State) -> State:
-    state["trace"] = get_trace()
-    return state
+    return {"trace": get_trace()}
+
 
 
 # Build graph
