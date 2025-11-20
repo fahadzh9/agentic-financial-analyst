@@ -1,28 +1,36 @@
 import os
+import re
+import json
+import time
+import datetime as _dt
+from decimal import Decimal
+from typing import Any, Dict, List, TypedDict
 
-# 🔑 Keys (set via env vars)
+import anthropic
+import httpx
+import numpy as _np
+import psycopg
+import requests
+from anthropic import Anthropic
+from langgraph.graph import StateGraph, END
+from psycopg.rows import dict_row
+
+# === Environment & feature toggles ===
 os.environ["ANTHROPIC_API_KEY"] = os.getenv("ANTHROPIC_API_KEY", "")
 os.environ["TAVILY_API_KEY"] = os.getenv("TAVILY_API_KEY", "")
-print(os.environ["ANTHROPIC_API_KEY"])
-# 🤖 Models
 os.environ["CLAUDE_MODEL"] = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
-os.environ["STRATEGY_MODEL"] = os.getenv("STRATEGY_MODEL", "claude-sonnet-4-5-20250929")
+os.environ["STRATEGY_MODEL"] = os.getenv("STRATEGY_MODEL", os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929"))
 
-# ⚙️ Feature toggles
 USE_SQL_LLM = True
 ENABLE_TRACE = True
-
-# 🌍 Macro mode
 MACRO_MODE = os.getenv("MACRO_MODE", "llm")  # "llm" or "static"
 STATIC_MACRO_QUERY = "Saudi Arabia macro consumer demand inflation retail confidence policy latest"
 
-import os, time, anthropic, httpx
-from anthropic import Anthropic
+# Clear proxies to avoid httpx proxy errors in some deployments
+for _k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy"]:
+    os.environ.pop(_k, None)
 
-import psycopg
-from psycopg.rows import dict_row
-
-# 🛠️ DB creds from environment (for Supabase/Postgres, etc.)
+# === Database config ===
 PG = {
     "host": os.getenv("PGHOST", "localhost"),
     "port": int(os.getenv("PGPORT", "5432")),
@@ -46,15 +54,12 @@ ALLOWED_TABLES = [
 
 def db_session():
     return psycopg.connect(
-        host=PG["host"],
-        port=PG["port"],
-        dbname=PG["dbname"],
-        user=PG["user"],
-        password=PG["password"],
+        host=PG["host"], port=PG["port"], dbname=PG["dbname"], user=PG["user"], password=PG["password"]
     )
 
 
-from typing import Dict, List
+# === Introspection ===
+from typing import Optional
 
 
 def introspect_columns():
@@ -72,67 +77,42 @@ def introspect_columns():
 
 meta = introspect_columns()
 by_table_cols: Dict[str, List[str]] = {}
-for r in meta:
-    by_table_cols.setdefault(r["table_name"], []).append(r["column_name"])
+for _r in meta:
+    by_table_cols.setdefault(_r["table_name"], []).append(_r["column_name"])
 
-MARKET_TABLES = [
-    "saudimarketcompanies",
-    "balancesheets",
-    "incomestatements",
-    "sectors",
-]
-CLIENT_TABLES = [
-    "clients",
-    "clientcompanies",
-    "clientbalancesheets",
-    "clientincomestatements",
-]
+MARKET_TABLES = ["saudimarketcompanies", "balancesheets", "incomestatements", "sectors"]
+CLIENT_TABLES = ["clients", "clientcompanies", "clientbalancesheets", "clientincomestatements"]
 
 
 def pick(cols: List[str], cands: List[str]):
     lc = {c.lower(): c for c in cols}
-    for c in cands:
-        if c.lower() in lc:
-            return lc[c.lower()]
+    for p in cands:
+        if p.lower() in lc:
+            return lc[p.lower()]
+    for p in cands:
+        for c in cols:
+            if p.lower() in c.lower():
+                return c
     return None
 
 
 def infer_client_roles(by: Dict[str, List[str]]):
-    # choose income table first
-    t = (
-        "clientincomestatements"
-        if "clientincomestatements" in by
-        else next((x for x in by if "income" in x), "clientincomestatements")
-    )
+    t = "clientincomestatements" if "clientincomestatements" in by else next((x for x in by if "income" in x and "client" in x), "clientincomestatements")
     cols = by.get(t, [])
     comp = by.get("clientcompanies", [])
     return {
         "table": t,
-        "company_id": pick(cols, ["client_company_id"]) or "client_company_id",
+        "client_company_id": pick(cols, ["client_company_id", "clientcompanyid", "company_id", "client_id"]) or "client_company_id",
         "company_name": pick(comp, ["company_name", "name"]) or "company_name",
         "year": pick(cols, ["year"]) or "year",
         "quarter": pick(cols, ["quarter", "qtr"]) or "quarter",
         "revenue": pick(cols, ["total_revenue", "revenue", "net_sales", "sales"]) or "total_revenue",
-        "op_inc": pick(
-            cols,
-            [
-                "operating_income",
-                "operating_profit",
-                "operating_income_loss",
-                "total_operating_income",
-                "total_operating_income_as_reported",
-            ],
-        )
-        or "operating_income",
+        "op_inc": pick(cols, ["operating_income", "operating_profit", "total_operating_income_as_reported"]) or "operating_income",
     }
 
 
 def infer_market_roles(by: Dict[str, List[str]]):
-    t = (
-        "incomestatements"
-        if "incomestatements" in by
-        else next((x for x in by if "income" in x), "incomestatements")
-    )
+    t = "incomestatements" if "incomestatements" in by else next((x for x in by if "income" in x), "incomestatements")
     cols = by.get(t, [])
     comp = by.get("saudimarketcompanies", [])
     return {
@@ -143,397 +123,686 @@ def infer_market_roles(by: Dict[str, List[str]]):
         "year": pick(cols, ["year"]) or "year",
         "quarter": pick(cols, ["quarter", "qtr"]) or "quarter",
         "revenue": pick(cols, ["total_revenue", "revenue", "net_sales", "sales"]) or "total_revenue",
-        "op_inc": pick(
-            cols,
-            [
-                "operating_income",
-                "operating_profit",
-                "operating_income_loss",
-                "total_operating_income",
-                "total_operating_income_as_reported",
-            ],
-        )
-        or "operating_income",
+        "op_inc": pick(cols, ["operating_income", "operating_profit", "total_operating_income_as_reported"]) or "operating_income",
     }
 
 
 ROLES = {"client": infer_client_roles(by_table_cols), "market": infer_market_roles(by_table_cols)}
 
 
-def describe_schema():
-    from textwrap import indent
-
-    lines = []
-    lines.append("Tables and columns:")
-    order = [
-        t for t in MARKET_TABLES if t in by_table_cols
-    ] + [t for t in CLIENT_TABLES if t in by_table_cols] + [
-        t for t in by_table_cols if t not in MARKET_TABLES + CLIENT_TABLES
+def build_schema_hint():
+    lines = [
+        "Result contract (REQUIRED aliases in final SELECT):",
+        "- year AS year (INT)",
+        "- quarter AS quarter (INT; if 'Q1'..'Q4' normalize with regexp_replace)",
+        "- total_revenue AS revenue (NUMERIC)",
+        "- operating_income AS operating_income (NUMERIC)",
+        "- period_end_date AS period_end_date (DATE)",
+        "- series AS series (TEXT: 'client' or 'market')",
+        "- entity_id AS entity_id (TEXT), entity_label AS entity_label (TEXT)",
+        "",
+        "Tables:",
     ]
+    order = [t for t in MARKET_TABLES if t in by_table_cols] + [t for t in CLIENT_TABLES if t in by_table_cols] + [t for t in by_table_cols if t not in MARKET_TABLES + CLIENT_TABLES]
     for t in order:
         lines.append(f"- {t}(" + ", ".join(by_table_cols[t]) + ")")
-    lines.append("")
-    lines.append("Roles:")
-    for k, v in ROLES.items():
-        lines.append(f"- {k}:")
-        for kk, vv in v.items():
-            lines.append(f"    {kk}: {vv}")
-    return "\n".join(lines)
+    rel = [
+        "Relationships:",
+        "- Market: incomestatements.(company_id, year, quarter, total_revenue, operating_income) ↔ saudimarketcompanies.(company_id, ticker, company_name, sector_id)",
+        "- Client: clientincomestatements.(client_company_id, year, quarter, total_revenue, operating_income) ↔ clientcompanies.(client_company_id, company_name, sector_id)",
+        "- Benchmark mapping: join clientcompanies.company_name = saudimarketcompanies.company_name (lowercased).",
+    ]
+    rules = [
+        "Policy:",
+        "- SELECT-only. NO DDL/DML.",
+        "- MUST include %(client_company_id)s (never client name).",
+        "- ORDER BY year DESC, quarter DESC; LIMIT ≤ 200.",
+        "- Keep SQL simple, auditable.",
+    ]
+    return "\n".join(lines + rel + rules)
 
 
-import re, json, requests
-from typing import Dict, Any
+SCHEMA_HINT = build_schema_hint()
+
+# === SQL guardrails ===
+SQL_DEFAULT_LIMIT = 200
 
 
-def tavily_search(query: str, max_results: int = 4) -> Dict[str, Any]:
-    api_key = os.getenv("TAVILY_API_KEY", "")
-    if not api_key:
-        return {"error": "TAVILY_API_KEY not set", "results": []}
-    url = "https://api.tavily.com/search"
-    payload = {
-        "api_key": api_key,
-        "query": query,
-        "max_results": max_results,
-        "search_depth": "basic",
-        "include_domains": [],
-        "exclude_domains": [],
-        "include_answer": True,
-        "include_raw_content": False,
-    }
-    resp = requests.post(url, json=payload, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    return data
+def inject_limit(sql: str, default_limit: int = SQL_DEFAULT_LIMIT) -> str:
+    up = sql.upper()
+    if " LIMIT " in up or " OFFSET " in up or "FETCH NEXT " in up:
+        return sql
+    return sql.rstrip().rstrip(";") + f" LIMIT {default_limit};"
 
 
-TRACE_LAST: Dict[str, Any] = {}
-
-
-def reset_trace():
-    global TRACE_LAST
-    TRACE_LAST = {}
-
-
-def get_trace():
-    return TRACE_LAST
-
-
-def sql_llm_agent(user_query: str, client_company_id: int | str) -> Dict[str, Any]:
-    """
-    Use Anthropic to synthesize a safe SQL query for the client's data,
-    along with parameters, and a natural-language rationale.
-    """
-    global TRACE_LAST
-    aclient = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""), http_client=httpx.Client(timeout=60.0))
-    schema_text = describe_schema()
-    prompt = f"""
-You are a senior financial data engineer. We have the following PostgreSQL schema and roles:
-
-{schema_text}
-
-The user query is:
-
-{user_query!r}
-
-The caller will supply a `client_company_id` = {client_company_id!r}.
-
-Task:
-1. Generate a single, safe SQL query that:
-   - Filters on the given client_company_id for client data.
-   - Joins to market tables when relevant.
-   - Returns a tidy time series of quarterly metrics to support the question (e.g. revenue, operating income, margins, etc.).
-2. Use **named parameters** in PostgreSQL format (e.g. `%(client_company_id)s`) instead of positional markers like `$1`.
-   - Always include a `params` JSON object whose keys match the named parameters you used.
-   - Do not emit `$1`, `$2`, etc.
-3. Provide a short explanation of what you are doing.
-
-Output strictly as JSON with keys:
-- "sql": string
-- "params": object
-- "rationale": string
-"""
-    t0 = time.perf_counter()
-    resp = aclient.messages.create(
-        model=os.getenv("CLAUDE_MODEL"),
-        max_tokens=800,
-        temperature=0,
-        system="You only output valid JSON for a financial SQL generation task.",
-        messages=[{"role": "user", "content": prompt}],
-    )
-    dt = int((time.perf_counter() - t0) * 1000)
-    raw = "".join(
-        [b.text for b in resp.content if getattr(b, "type", None) == "text"]  # type: ignore[attr-defined]
-    ).strip()
-    try:
-        data = json.loads(raw)
-    except Exception:
-        # Try to extract JSON block
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not m:
-            raise
-        data = json.loads(m.group(0))
-    TRACE_LAST["sql_agent"] = {
-        "provider": "anthropic",
-        "model": resp.model,
-        "latency_ms": dt,
-        "rationale": data.get("rationale"),
-        "json_fragment": raw[:1000],
-    }
-    return data
-
-
-from decimal import Decimal
-import datetime as _dt
-import numpy as _np
-
-
-def run_safe_query(sql: str, params: Dict[str, Any] | None = None):
-    """
-    Guardrails: block destructive SQL; only allow SELECT.
-    """
+def safe_execute(sql: str, params: Dict[str, Any] | None = None):
     up = sql.strip().upper()
-    if any(
-        up.startswith(x)
-        for x in ["DROP ", "DELETE ", "UPDATE ", "INSERT ", "ALTER ", "TRUNCATE ", "CREATE "]
-    ):
+    if any(up.startswith(x) for x in ["DROP ", "DELETE ", "UPDATE ", "INSERT ", "ALTER ", "TRUNCATE ", "CREATE "]):
         raise ValueError("Unsafe SQL blocked by guardrails")
-
-    def normalize_sql_params(raw_sql: str, raw_params: Dict[str, Any] | None):
-        """Translate positional placeholders ($1) into psycopg-friendly params."""
-
-        if not raw_params:
-            return raw_sql, raw_params
-        if re.search(r"\$\d+", raw_sql):
-            ordered_markers = [int(m) for m in re.findall(r"\$(\d+)", raw_sql)]
-
-            if isinstance(raw_params, dict):
-                keys = list(raw_params.keys())
-
-                def value_for_index(idx: int):
-                    # Prefer matching key order, otherwise fall back to the first value
-                    if 0 <= idx - 1 < len(keys):
-                        return raw_params[keys[idx - 1]]
-                    return raw_params.get("client_company_id", next(iter(raw_params.values())))
-
-                values = tuple(value_for_index(i) for i in ordered_markers)
-                return re.sub(r"\$\d+", "%s", raw_sql), values
-
-            if isinstance(raw_params, (list, tuple)):
-                def value_for_index(idx: int):
-                    if 0 <= idx - 1 < len(raw_params):
-                        return raw_params[idx - 1]
-                    return raw_params[-1] if raw_params else None
-
-                values = tuple(value_for_index(i) for i in ordered_markers)
-                return re.sub(r"\$\d+", "%s", raw_sql), values
-        return raw_sql, raw_params
-
-    sql, exec_params = normalize_sql_params(sql, params)
     with db_session() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql, exec_params or {})
-            rows = cur.fetchall()
-    # Basic normalization for JSON serialization
-    def norm(v):
-        if isinstance(v, (Decimal, _np.number)):
-            return float(v)
-        if isinstance(v, (_dt.date, _dt.datetime)):
-            return v.isoformat()
-        return v
-
-    return [dict((k, norm(v)) for k, v in r.items()) for r in rows]
+            cur.execute(sql, params or {})
+            return cur.fetchall()
 
 
-def macro_llm_agent(user_query: str, sector_name: str | None) -> Dict[str, Any]:
-    """
-    Use Tavily + Anthropic to get compact macro context for the sector/company.
-    """
+# === SQL Agent with fallback ===
+SYSTEM_MSG = (
+    "You are a senior financial SQL generator.\n"
+    "Return STRICT JSON with keys: sql (string), params (object), rationale (string).\n"
+    "Result contract: Final SELECT MUST alias the following columns exactly:\n"
+    "[year, quarter, revenue, operating_income, period_end_date, series, entity_id, entity_label].\n\n"
+    "CRITICAL RULES for 'quarter':\n"
+    "• Many tables store quarter like 'Q1','Q2', or text. NEVER do arithmetic on raw quarter.\n"
+    "• ALWAYS compute QUARTER_INT as: regexp_replace(concat('', <alias>.<quarter>), '[^0-9]', '', 'g')::INT\n"
+    "  and use QUARTER_INT for any math or MAKE_DATE.\n"
+    "• Example for period_end_date: make_date(year::INT, QUARTER_INT*3, 1) + INTERVAL '2 months'\n\n"
+    "General Rules:\n"
+    "- SELECT-only. LIMIT <= 200.\n"
+    "- MUST include %(client_company_id)s parameter (never client name).\n"
+    "- Benchmarking allowed by joining clientcompanies.company_name to saudimarketcompanies.company_name (lowercased).\n"
+    "- ORDER BY year DESC, quarter DESC. Keep SQL simple, auditable.\n"
+)
+
+TRACE_LAST: Dict[str, Any] = {"sql_agent": {}, "health": {}, "macro_prompt": {}, "strategy_llm_primary": {}, "fallback_used": False}
+
+
+def _trace_reset():
     global TRACE_LAST
-    query = STATIC_MACRO_QUERY if MACRO_MODE == "static" else f"{sector_name or ''} Saudi Arabia macro {user_query}"
-    tav = tavily_search(query, max_results=5)
-    snippets = []
-    for r in tav.get("results", []):
-        title = r.get("title", "")
-        snip = (r.get("content", "") or "")[:400]
-        snippets.append(f"- {title}: {snip}")
-    context = "\n".join(snippets) or "No macro results."
+    TRACE_LAST = {"sql_agent": {}, "health": {}, "macro_prompt": {}, "strategy_llm_primary": {}, "fallback_used": False}
 
-    aclient = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""), http_client=httpx.Client(timeout=60.0))
-    prompt = f"""
-You are a macro analyst.
 
-We have this macro search context:
-
-{context}
-
-Given the user question:
-
-{user_query!r}
-
-Summarize 3-5 key macro factors from this context that are most relevant to this company's performance
-and assign each a rough polarity: positive, neutral, or negative.
-
-Return JSON with:
-- "summary": string
-- "drivers": [{{"name": str, "polarity": "positive"|"negative"|"neutral", "comment": str}}]
-"""
+def call_claude_json(query: str) -> str:
+    client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""), http_client=httpx.Client(timeout=60.0))
     t0 = time.perf_counter()
-    resp = aclient.messages.create(
-        model=os.getenv("CLAUDE_MODEL"),
-        max_tokens=600,
-        temperature=0.1,
-        system="You only output valid JSON for a macro context summary.",
-        messages=[{"role": "user", "content": prompt}],
-    )
-    dt = int((time.perf_counter() - t0) * 1000)
-    raw = "".join(
-        [b.text for b in resp.content if getattr(b, "type", None) == "text"]  # type: ignore[attr-defined]
-    ).strip()
-    try:
-        data = json.loads(raw)
-    except Exception:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not m:
-            raise
-        data = json.loads(m.group(0))
-
-    TRACE_LAST["macro"] = {"provider": "anthropic", "model": resp.model, "latency_ms": dt, "raw": raw[:1000]}
-    return data
-
-
-import json, re, time, httpx, requests
-from anthropic import Anthropic
-
-
-def health_llm_agent(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Have an LLM sanity-check the shape of the numeric data / time series.
-    """
-    global TRACE_LAST
-    aclient = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""), http_client=httpx.Client(timeout=60.0))
-    preview = json.dumps(rows[:24], indent=2)
-    prompt = f"""
-You are a senior data quality engineer.
-
-We have a time series of quarterly company financial metrics (sample below, first up to 24 rows):
-
-{preview}
-
-Check for obvious issues:
-- Missing quarters or large gaps.
-- Zero or negative revenue where it looks implausible.
-- Weird jumps in revenue or margins.
-
-Return JSON with:
-- "status": "ok" | "warning" | "error"
-- "issues": [string]
-- "notes": string
-"""
-    t0 = time.perf_counter()
-    resp = aclient.messages.create(
-        model=os.getenv("CLAUDE_MODEL"),
-        max_tokens=600,
+    resp = client.messages.create(
+        model=os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929"),
+        max_tokens=1200,
         temperature=0,
-        system="You only output valid JSON for a data quality summary.",
-        messages=[{"role": "user", "content": prompt}],
+        system=SYSTEM_MSG,
+        messages=[{"role": "user", "content": json.dumps({"question": query, "schema_hint": SCHEMA_HINT}, ensure_ascii=False)}],
     )
-    dt = int((time.perf_counter() - t0) * 1000)
-    raw = "".join(
-        [b.text for b in resp.content if getattr(b, "type", None) == "text"]  # type: ignore[attr-defined]
-    ).strip()
+    latency = int((time.perf_counter() - t0) * 1000)
+    text = "".join([b.text for b in resp.content if b.type == "text"])
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not m:
+        raise ValueError("Claude returned no JSON object")
+    js = m.group(0)
+    if ENABLE_TRACE:
+        TRACE_LAST["sql_agent"] = {
+            "provider": "anthropic",
+            "model": os.getenv("CLAUDE_MODEL"),
+            "latency_ms": latency,
+            "raw": text[:2000],
+            "json_fragment": js[:1000],
+        }
+    return js
+
+
+def _maybe_order_by_yq(sql: str) -> str:
+    low = sql.lower()
+    if (" order by " not in low) and ((" year " in low) or ("year::" in low)) and ((" quarter " in low) or ("quarter::" in low)):
+        return sql.rstrip().rstrip(";") + " ORDER BY year DESC, quarter DESC"
+    return sql
+
+
+def fallback_sql() -> str:
+    rc = ROLES["client"]
+    rm = ROLES["market"]
+    return (
+        f"WITH mine AS ("
+        f" SELECT ci.{rc['year']}::INT AS year,"
+        f"        regexp_replace(concat('', ci.{rc['quarter']}), '[^0-9]', '', 'g')::INT AS quarter,"
+        f"        ci.{rc['revenue']}::NUMERIC AS revenue, ci.{rc['op_inc']}::NUMERIC AS operating_income,"
+        f"        (make_date(ci.{rc['year']}::INT, (regexp_replace(concat('', ci.{rc['quarter']}), '[^0-9]', '', 'g')::INT)*3, 1) + INTERVAL '2 months')::DATE AS period_end_date,"
+        f"        'client'::TEXT AS series, ci.{rc['client_company_id']}::TEXT AS entity_id, cc.{rc['company_name']}::TEXT AS entity_label"
+        f" FROM {rc['table']} ci JOIN clientcompanies cc ON cc.{rc['client_company_id']}=ci.{rc['client_company_id']}"
+        f" WHERE ci.{rc['client_company_id']}=%(client_company_id)s"
+        f" ORDER BY ci.{rc['year']} DESC, regexp_replace(concat('', ci.{rc['quarter']}), '[^0-9]', '', 'g')::INT DESC"
+        f" LIMIT 8),"
+        f" map_market AS ("
+        f" SELECT sm.company_id AS market_company_id FROM clientcompanies cc"
+        f" JOIN saudimarketcompanies sm ON LOWER(cc.{rc['company_name']}) = LOWER(sm.{rm['company_name']})"
+        f" WHERE cc.{rc['client_company_id']}=%(client_company_id)s LIMIT 1),"
+        f" market AS ("
+        f" SELECT mi.{rm['year']}::INT AS year,"
+        f"        regexp_replace(concat('', mi.{rm['quarter']}), '[^0-9]', '', 'g')::INT AS quarter,"
+        f"        mi.{rm['revenue']}::NUMERIC AS revenue, mi.{rm['op_inc']}::NUMERIC AS operating_income,"
+        f"        (make_date(mi.{rm['year']}::INT, (regexp_replace(concat('', mi.{rm['quarter']}), '[^0-9]', '', 'g')::INT)*3, 1) + INTERVAL '2 months')::DATE AS period_end_date,"
+        f"        'market'::TEXT AS series, sm.{rm['ticker']}::TEXT AS entity_id, sm.{rm['company_name']}::TEXT AS entity_label"
+        f" FROM {rm['table']} mi JOIN saudimarketcompanies sm ON sm.company_id=mi.{rm['company_id']}"
+        f" WHERE mi.{rm['company_id']}=(SELECT market_company_id FROM map_market)"
+        f" ORDER BY mi.{rm['year']} DESC, regexp_replace(concat('', mi.{rm['quarter']}), '[^0-9]', '', 'g')::INT DESC"
+        f" LIMIT 8)"
+        f" SELECT * FROM mine UNION ALL SELECT * FROM market ORDER BY year DESC, quarter DESC;"
+    )
+
+
+def generate_sql(query: str) -> str:
+    if not os.getenv("ANTHROPIC_API_KEY") or not os.getenv("CLAUDE_MODEL"):
+        TRACE_LAST["fallback_used"] = True
+        return fallback_sql()
     try:
-        data = json.loads(raw)
-    except Exception:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not m:
-            raise
-        data = json.loads(m.group(0))
-    TRACE_LAST["health"] = {"provider": "anthropic", "model": resp.model, "latency_ms": dt, "raw": raw[:1200]}
-    return data
+        obj = json.loads(call_claude_json(query))
+        sql = (obj.get("sql") or "").strip()
+        TRACE_LAST["sql_agent"]["rationale"] = obj.get("rationale")
+
+        up = sql.upper()
+        if (not sql) or any(up.startswith(x) for x in ["DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE", "CREATE"]):
+            TRACE_LAST["fallback_used"] = True
+            return fallback_sql()
+        if "%(client_company_id)s" not in sql or "%(client_name)s" in sql:
+            TRACE_LAST["fallback_used"] = True
+            return fallback_sql()
+
+        sql = _maybe_order_by_yq(sql)
+        if " LIMIT " not in up:
+            sql = inject_limit(sql)
+        return sql
+    except Exception as e:  # noqa: BLE001
+        TRACE_LAST["fallback_used"] = True
+        TRACE_LAST["sql_agent"]["error"] = str(e)
+        return fallback_sql()
 
 
-from anthropic import Anthropic
+# === JSON helpers ===
+
+def make_json_safe(obj: Any):
+    if obj is None:
+        return None
+    if isinstance(obj, Decimal):
+        try:
+            return float(obj)
+        except Exception:  # noqa: BLE001
+            return str(obj)
+    if isinstance(obj, (_dt.date, _dt.datetime)):
+        return obj.isoformat()
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", "ignore")
+    if isinstance(obj, (_np.integer, _np.floating)):
+        return float(obj)
+    if isinstance(obj, list):
+        return [make_json_safe(x) for x in obj]
+    if isinstance(obj, tuple):
+        return [make_json_safe(x) for x in obj]
+    if isinstance(obj, dict):
+        return {str(k): make_json_safe(v) for k, v in obj.items()}
+    return obj
 
 
-def strategy_llm_agent(
-    user_query: str,
-    rows: List[Dict[str, Any]],
-    health: Dict[str, Any],
-    macro: Dict[str, Any],
-    sector_name: str | None,
-) -> Dict[str, Any]:
+def canonicalize_rows(rows: List[Dict[str, Any]]):
+    out = []
+    for r in rows:
+        c = dict(r)
+        if "revenue" not in c and "total_revenue" in c:
+            c["revenue"] = c.get("total_revenue")
+        if "operating_income" not in c:
+            for k in ["op_income", "total_operating_income_as_reported", "operating_profit"]:
+                if k in c:
+                    c["operating_income"] = c.get(k)
+        if "quarter" not in c:
+            for k in ["quarter_num", "qtr", "qtr_num"]:
+                if k in c:
+                    c["quarter"] = c.get(k)
+        if "series" not in c:
+            c["series"] = "client"
+        out.append(c)
+    return out
+
+
+# === Sector helper ===
+
+def get_sector_name(client_company_id: int | str) -> Optional[str]:
+    q = """
+    SELECT s.sector_name
+    FROM clientcompanies c
+    LEFT JOIN sectors s ON s.sector_id = c.sector_id
+    WHERE c.client_company_id = %(client_company_id)s
+    LIMIT 1;
     """
-    Turn metrics + macro into a prioritized action plan.
-    """
-    global TRACE_LAST
+    rows = safe_execute(q, {"client_company_id": client_company_id})
+    return (rows[0].get("sector_name") if rows else None) or None
+
+
+OIL_RELEVANT_SECTORS = {
+    "OIL_GAS",
+    "ENERGY",
+    "PETROCHEMICALS",
+    "CHEMICALS",
+    "AIRLINES",
+    "SHIPPING",
+    "LOGISTICS",
+    "TRANSPORT",
+}
+
+
+# === Macro prompt agent + Tavily ===
+
+def _sanitize_macro_query(s: str, max_len: int = 180) -> str:
+    s = re.sub(r"[^A-Za-z0-9\s\-,/():&]+", " ", s or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:max_len]
+
+
+def _sector_default_query(sector: Optional[str]) -> str:
+    s = (sector or "").upper()
+    if s in OIL_RELEVANT_SECTORS:
+        return "Saudi Arabia energy demand fuel prices refinery margins shipping freight latest"
+    if "FOOD" in s or "BEVERAGE" in s:
+        return "Saudi Arabia food & beverage demand inflation FAO Food Price Index wheat sugar palm oil packaging freight latest"
+    if "RETAIL" in s or "CONSUMER" in s:
+        return "Saudi Arabia consumer spending retail sales inflation employment confidence latest"
+    if "CEMENT" in s or "BUILD" in s or "CONSTRUCTION" in s:
+        return "Saudi Arabia construction cement demand input costs freight policy projects latest"
+    return "Saudi Arabia macro consumer demand inflation retail confidence policy latest"
+
+
+def macro_prompt_agent(user_query: str, rows: List[Dict[str, Any]], health: Dict[str, Any], sector_name: Optional[str]) -> Dict[str, Any]:
+    brief = {}
+    try:
+        last = (rows or [None])[0] or {}
+        brief = {
+            "sector": sector_name,
+            "latest_quarter": str(last.get("quarter")),
+            "latest_year": str(last.get("year")),
+            "latest_rev": last.get("total_revenue") or last.get("revenue"),
+            "latest_op": last.get("operating_income"),
+            "health_verdict": (health or {}).get("verdict"),
+            "health_score": (health or {}).get("score"),
+        }
+    except Exception:  # noqa: BLE001
+        brief = {}
+
+    system = (
+        "You write ONE concise web search query for macro context that is RELEVANT TO THE SECTOR.\n"
+        "Rules:\n"
+        "- Prefer the company's sector; avoid generic oil unless sector is directly oil-exposed (energy, petrochem, airlines, shipping, transport).\n"
+        "- For FOOD/BEVERAGE emphasize: FAO Food Price Index, wheat/sugar/palm oil, packaging/plastics, freight, consumer demand/retail.\n"
+        "- 6–16 keywords; include 'Saudi Arabia' and 'latest' when helpful.\n"
+        "Output STRICT JSON: {\"query\":\"...\", \"tags\":[oil_prices,rates_fx,inflation,demand,supply_costs,policy,food_inputs,freight]}\n"
+        "If unsure, avoid oil and focus on demand/inflation/sector inputs."
+    )
+
     aclient = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""), http_client=httpx.Client(timeout=60.0))
-    rows_preview = json.dumps(rows[-16:], indent=2)
-    macro_summary = macro.get("summary", "")
-    macro_drivers = macro.get("drivers", [])
-    health_status = health.get("status", "unknown")
-    health_issues = health.get("issues", [])
-
-    prompt = f"""
-You are a senior strategy consultant for a Saudi {sector_name or "company"}.
-
-User question:
-{user_query!r}
-
-We have:
-- Recent quarterly financials (last rows):
-{rows_preview}
-
-- Data quality assessment:
-  - status: {health_status}
-  - issues: {health_issues}
-
-- Macro context:
-  - summary: {macro_summary}
-  - drivers: {macro_drivers}
-
-Task:
-1. Provide a one-sentence overall stance (e.g. "Cautiously positive", "Under pressure with margin risk").
-2. Provide 3-7 concrete recommended actions for the next 90 days, specific and operational.
-3. Provide 3-5 key signals to monitor (with rationale).
-
-Return JSON with:
-- "stance": string
-- "actions": [string]
-- "signals": {{"financial": [string], "operational": [string], "macro": [string]}}
-"""
+    payload = {"user_question": user_query, "signals": make_json_safe(brief)}
     t0 = time.perf_counter()
     resp = aclient.messages.create(
-        model=os.getenv("STRATEGY_MODEL"),
-        max_tokens=900,
-        temperature=0.3,
-        system="You only output valid JSON for a strategic recommendation summary.",
-        messages=[{"role": "user", "content": prompt}],
+        model=os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929"),
+        max_tokens=200,
+        temperature=0,
+        system=system,
+        messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
     )
-    dt = int((time.perf_counter() - t0) * 1000)
-    raw = "".join(
-        [b.text for b in resp.content if getattr(b, "type", None) == "text"]  # type: ignore[attr-defined]
-    ).strip()
+    latency = int((time.perf_counter() - t0) * 1000)
+    raw = "".join([b.text for b in resp.content if b.type == "text"])
     try:
-        data = json.loads(raw)
-    except Exception:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not m:
-            raise
-        data = json.loads(m.group(0))
-    TRACE_LAST["strategy_llm_primary"] = {
-        "provider": "anthropic",
-        "model": resp.model,
-        "latency_ms": dt,
-        "raw": raw[:1000],
+        j = json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
+    except Exception:  # noqa: BLE001
+        j = {"query": _sector_default_query(sector_name), "tags": []}
+
+    q = _sanitize_macro_query(j.get("query") or _sector_default_query(sector_name))
+    tags = [t for t in (j.get("tags") or []) if isinstance(t, str)]
+
+    s_up = (sector_name or "").upper()
+    if s_up and s_up not in OIL_RELEVANT_SECTORS:
+        tags = [t for t in tags if t != "oil_prices"]
+        if ("FOOD" in s_up or "BEVERAGE" in s_up) and "food_inputs" not in tags:
+            tags.append("food_inputs")
+
+    if ENABLE_TRACE:
+        TRACE_LAST["macro_prompt"] = {
+            "provider": "anthropic",
+            "model": os.getenv("CLAUDE_MODEL"),
+            "latency_ms": latency,
+            "query": q,
+            "tags": tags,
+            "raw": raw[:400],
+        }
+    return {"query": q, "tags": tags}
+
+
+def fetch_macro_dynamic(user_query: str, client_company_id: str | int, rows: List[Dict[str, Any]], health: Dict[str, Any], sector_name: Optional[str], max_results: int = 5):
+    key = os.getenv("TAVILY_API_KEY", "")
+    if MACRO_MODE == "llm":
+        mp = macro_prompt_agent(user_query, rows, health, sector_name)
+        q = mp.get("query") or _sector_default_query(sector_name)
+        llm_tags = mp.get("tags") or []
+    else:
+        q = _sector_default_query(sector_name)
+        llm_tags = []
+
+    if not key:
+        return {"warning": "TAVILY_API_KEY not set; macro skipped.", "query": q, "llm_tags": llm_tags, "results": []}
+    try:
+        r = requests.post(
+            "https://api.tavily.com/search",
+            json={"api_key": key, "query": q, "max_results": max_results, "search_depth": "basic", "include_answer": False},
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+        results = [
+            {"title": it.get("title"), "url": it.get("url"), "content": (it.get("content") or "")[:300]}
+            for it in data.get("results", [])[:max_results]
+        ]
+        return {"query": q, "results": results, "llm_tags": llm_tags}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e), "query": q, "llm_tags": llm_tags, "results": []}
+
+
+# === Narrative builder ===
+REV_KEYS = ["revenue", "total_revenue"]
+OPI_KEYS = ["operating_income", "op_income", "total_operating_income_as_reported"]
+
+
+def _abbr_num(x):
+    try:
+        n = float(x)
+    except Exception:  # noqa: BLE001
+        return None
+    a = abs(n)
+    if a >= 1e9:
+        return f"{n/1e9:.1f}B"
+    if a >= 1e6:
+        return f"{n/1e6:.1f}M"
+    if a >= 1e3:
+        return f"{n/1e3:.1f}K"
+    return f"{n:.0f}"
+
+
+def _first_key(d: Dict[str, Any], keys: List[str]):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
+
+def _q_to_int(q):
+    if q is None:
+        return None
+    if isinstance(q, (int, float)):
+        try:
+            return int(q)
+        except Exception:  # noqa: BLE001
+            return None
+    m = re.search(r"(\d+)", str(q))
+    return int(m.group(1)) if m else None
+
+
+def _as_float(x):
+    try:
+        return None if x is None else float(x)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _pct(a, b):
+    try:
+        if b in (None, 0) or a is None:
+            return None
+        return (float(a) - float(b)) / abs(float(b)) * 100.0
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _margin(row: Dict[str, Any]):
+    rev = _as_float(_first_key(row, REV_KEYS))
+    op = _as_float(_first_key(row, OPI_KEYS))
+    if rev in (None, 0) or op is None:
+        return None
+    return (op / rev) * 100.0
+
+
+def _sort_key(row: Dict[str, Any]):
+    ped = row.get("period_end_date")
+    if ped is not None:
+        return ped, 5
+    y = _first_key(row, ["year", "fiscal_year"])
+    q = _q_to_int(_first_key(row, ["quarter", "qtr", "quarter_num", "qtr_num"]))
+    return y, q if q is not None else -1
+
+
+def _peer_for_period(rows: List[Dict[str, Any]], y, q):
+    for r in rows:
+        if r.get("series") == "market" and r.get("year") == y and _q_to_int(r.get("quarter")) == q:
+            return r
+    return None
+
+
+def build_narratives(rows: List[Dict[str, Any]], macro: Dict[str, Any]):
+    if not rows:
+        return "No recent data.", "No recent data."
+    rows = canonicalize_rows(rows)
+    client_rows = [r for r in rows if r.get("series") == "client"] or rows
+    client_rows = sorted(client_rows, key=_sort_key, reverse=True)
+
+    latest = client_rows[0]
+    prev = client_rows[1] if len(client_rows) > 1 else None
+
+    y = latest.get("year")
+    q = _q_to_int(latest.get("quarter"))
+    rev = _as_float(_first_key(latest, REV_KEYS))
+    rev_prev = _as_float(_first_key(prev, REV_KEYS)) if prev else None
+    op = _as_float(_first_key(latest, OPI_KEYS))
+
+    growth = _pct(rev, rev_prev) if prev else None
+    margin = _margin(latest)
+
+    peer = _peer_for_period(rows, y, q)
+    peer_mrg = _margin(peer) if peer else None
+    spread = None if (margin is None or peer_mrg is None) else (margin - peer_mrg)
+
+    macro_titles = [(it.get("title") or "").strip() for it in (macro.get("results") or [])[:2] if (it.get("title") or "").strip()]
+    macro_part = f" On the macro side, we’re watching: {', '.join(macro_titles)}." if macro_titles else ""
+
+    if rev is not None and margin is not None and growth is not None:
+        dir_en = "up" if growth >= 0 else "down"
+        rev_fmt = _abbr_num(rev) or f"{rev:,.0f}"
+        peer_txt = f" (market {peer_mrg:.1f}%, spread {spread:+.1f} pp)" if (peer_mrg is not None and spread is not None) else ""
+        en = f"In Q{q} {y}, revenue reached {rev_fmt}, {dir_en} {abs(growth):.1f}% vs last quarter. Operating margin was {margin:.1f}%{peer_txt}.{macro_part}"
+    else:
+        parts = []
+        if rev is not None:
+            rev_fmt = _abbr_num(rev) or f"{rev:,.0f}"
+            base = f"In Q{q} {y}, revenue was {rev_fmt}"
+            if growth is not None:
+                dir_en = "up" if growth >= 0 else "down"
+                base += f", {dir_en} {abs(growth):.1f}% vs last quarter"
+            parts.append(base + ".")
+        if margin is not None:
+            peer_txt = f" (market {peer_mrg:.1f}%, spread {spread:+.1f} pp)" if (peer_mrg is not None and spread is not None) else ""
+            parts.append(f"Operating margin stood at {margin:.1f}%{peer_txt}.")
+        if not parts:
+            parts = ["We couldn’t compute a clean comparison for the latest quarter."]
+        en = " ".join(parts) + macro_part
+
+    short_bits = [
+        f"Revenue {('+' if (growth is not None and growth >= 0) else '')}{growth:.1f}% QoQ" if growth is not None else "Revenue n/a QoQ",
+        f"Margin {margin:.1f}%" if margin is not None else "Margin n/a",
+    ]
+    if macro_titles:
+        short_bits.append("Macro: " + ", ".join(macro_titles))
+    short = " • ".join(short_bits)
+    return en, short
+
+
+# === Health SQL + agent ===
+HEALTH_SQL = """
+WITH inc AS (
+  SELECT
+    ci.client_company_id,
+    ci.year::INT AS year,
+    regexp_replace(concat('', ci.quarter), '[^0-9]', '', 'g')::INT AS quarter,
+    (make_date(ci.year::INT, (regexp_replace(concat('', ci.quarter), '[^0-9]', '', 'g')::INT)*3, 1)
+     + INTERVAL '2 months')::DATE AS period_end_date,
+    ci.total_revenue,
+    ci.operating_income,
+    ci.ebitda,
+    ci.interest_expense
+  FROM clientincomestatements ci
+  WHERE ci.client_company_id = %(client_company_id)s
+),
+bs AS (
+  SELECT
+    cb.client_company_id,
+    cb.year::INT AS year,
+    regexp_replace(concat('', cb.quarter), '[^0-9]', '', 'g')::INT AS quarter,
+    (make_date(cb.year::INT, (regexp_replace(concat('', cb.quarter), '[^0-9]', '', 'g')::INT)*3, 1)
+     + INTERVAL '2 months')::DATE AS period_end_date,
+    cb.total_assets,
+    cb.current_assets,
+    cb.current_liabilities,
+    cb.cash_and_cash_equivalents,
+    cb.total_debt,
+    cb.stockholders_equity,
+    cb.net_debt
+  FROM clientbalancesheets cb
+  WHERE cb.client_company_id = %(client_company_id)s
+),
+merged AS (
+  SELECT
+    COALESCE(inc.client_company_id, bs.client_company_id) AS client_company_id,
+    COALESCE(inc.year, bs.year) AS year,
+    COALESCE(inc.quarter, bs.quarter) AS quarter,
+    COALESCE(inc.period_end_date, bs.period_end_date) AS period_end_date,
+    inc.total_revenue,
+    inc.operating_income,
+    inc.ebitda,
+    inc.interest_expense,
+    bs.total_assets,
+    bs.current_assets,
+    bs.current_liabilities,
+    bs.cash_and_cash_equivalents,
+    bs.total_debt,
+    bs.stockholders_equity,
+    bs.net_debt
+  FROM inc
+  FULL OUTER JOIN bs
+    ON inc.client_company_id = bs.client_company_id
+   AND inc.year = bs.year
+   AND inc.quarter = bs.quarter
+)
+SELECT *
+FROM merged
+ORDER BY year DESC, quarter DESC
+LIMIT 12;
+"""
+
+
+def get_health_rows(client_company_id: int | str):
+    return safe_execute(HEALTH_SQL, params={"client_company_id": client_company_id})
+
+
+def health_agent_llm(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    ctx_rows = (rows or [])[:8]
+    system = (
+        "You are a senior credit analyst. "
+        "Given up to 8 quarterly rows (latest first) with fields like year, quarter, period_end_date, "
+        "total_revenue, operating_income, ebitda, interest_expense, total_assets, current_assets, "
+        "current_liabilities, cash_and_cash_equivalents, total_debt, stockholders_equity, net_debt — "
+        "compute a financial health summary.\n\n"
+        "Output STRICT JSON with keys:\n"
+        "{\n"
+        '  "metrics": {\n'
+        '    "d_to_e": number|null,\n'
+        '    "interest_coverage": number|null,\n'
+        '    "net_debt": number|null,\n'
+        '    "net_debt_to_ebitda": number|null,\n'
+        '    "current_ratio": number|null,\n'
+        '    "quick_ratio": number|null,\n'
+        '    "margin_pct": number|null,\n'
+        '    "revenue_qoq_pct": number|null,\n'
+        '    "revenue_yoy_pct": number|null\n'
+        '  },\n'
+        '  "verdict": "strong"|"moderate"|"elevated"|"weak",\n'
+        '  "score": number,\n'
+        '  "green_flags": [string],\n'
+        '  "red_flags": [string],\n'
+        '  "rationale": string\n'
+        "}\n"
+        "Rules: Use only provided numbers; if a metric cannot be computed, set null. Return JSON only."
+    )
+    aclient = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""), http_client=httpx.Client(timeout=60.0))
+    payload = {"rows": make_json_safe(ctx_rows)}
+    t0 = time.perf_counter()
+    resp = aclient.messages.create(
+        model=os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929"),
+        max_tokens=900,
+        temperature=0,
+        system=system,
+        messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+    )
+    latency = int((time.perf_counter() - t0) * 1000)
+    raw = "".join([b.text for b in resp.content if getattr(b, "type", None) == "text"])
+    j = json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
+    if ENABLE_TRACE:
+        TRACE_LAST["health"] = {"provider": "anthropic", "model": resp.model, "latency_ms": latency, "raw": raw[:1200]}
+    return j
+
+
+# === Strategy agent ===
+FORBIDDEN_PHRASES = ["buy the stock", "short the stock", "invest now", "target price", "EPS upgrade", "equity raise", "issue shares", "IPO"]
+
+
+def strategy_llm_agent(user_query: str, rows: List[Dict[str, Any]], health: Dict[str, Any], macro: Dict[str, Any], sector_name: Optional[str] = None) -> Dict[str, Any]:
+    rows_ctx = (canonicalize_rows(rows) or [])[:8]
+    macro_ctx = (macro.get("results") or [])[:3]
+    macro_tags = macro.get("llm_tags", [])
+
+    system = (
+        "You are an operating strategy advisor.\n"
+        f"Company sector: {sector_name or 'UNKNOWN'}.\n"
+        "Tailor stance/actions to the user's question, using ONLY provided data (rows, health, macro tags/snippets).\n"
+        "Constraints:\n"
+        "- No investment advice (no trading, targets, etc.).\n"
+        "- If sector is NOT oil-exposed, avoid oil commentary unless macro_tags includes 'oil_prices'.\n"
+        "- Keep actions concrete and operational; ≤5 bullets.\n"
+        "Output STRICT JSON ONLY:\n"
+        "{\n"
+        '  "stance": "constructive – ..." | "defensive – ..." | "neutral – ..." | "mixed – ...",\n'
+        '  "actions": [string, string, string, string, string],\n'
+        '  "signals": { "margin_pct": number|null, "rev_growth_qoq_pct": number|null, "health_score": number|null, "macro_tags": [string] }\n'
+        "}"
+    )
+
+    aclient = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""), http_client=httpx.Client(timeout=60.0))
+    payload = {
+        "user_question": str(user_query or "").strip(),
+        "sector": sector_name,
+        "rows": make_json_safe(rows_ctx),
+        "health": health,
+        "macro": make_json_safe(macro_ctx),
+        "macro_tags": macro_tags,
     }
-    return data
+    t0 = time.perf_counter()
+    resp = aclient.messages.create(
+        model=os.getenv("STRATEGY_MODEL", os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")),
+        max_tokens=650,
+        temperature=0,
+        system=system,
+        messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+    )
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+    raw = "".join([b.text for b in resp.content if b.type == "text"])
+    j = json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
+
+    s_up = (sector_name or "").upper()
+    if s_up and s_up not in OIL_RELEVANT_SECTORS and "oil_prices" not in (macro_tags or []):
+        j["actions"] = [a for a in (j.get("actions") or []) if not re.search(r"\boil\b|\bbrent\b|\bopec\b", a, re.I)]
+
+    acts = [a for a in (j.get("actions") or []) if isinstance(a, str)][:5]
+    j["actions"] = acts
+    if "signals" not in j:
+        j["signals"] = {}
+    if "macro_tags" not in j["signals"]:
+        j["signals"]["macro_tags"] = macro_tags
+
+    if ENABLE_TRACE:
+        TRACE_LAST["strategy_llm_primary"] = {"provider": "anthropic", "model": resp.model, "latency_ms": latency_ms, "raw": raw[:1000]}
+        TRACE_LAST["strategy_user_prompt"] = str(user_query)[:240]
+    return j
 
 
 # === LangGraph wiring ===
-from langgraph.graph import StateGraph, END
-from typing import TypedDict, Any, List, Dict
-
-
 class State(TypedDict, total=False):
     user_query: str
     client_company_id: int | str
@@ -543,7 +812,7 @@ class State(TypedDict, total=False):
     health_rows: List[Dict[str, Any]]
     health: Dict[str, Any]
     macro: Dict[str, Any]
-    sector_name: str | None
+    sector_name: Optional[str]
     strategy: Dict[str, Any]
     final_answer: str
     short_answer: str
@@ -551,81 +820,53 @@ class State(TypedDict, total=False):
     error: str
 
 
-def node_build_sql(state: State) -> State:
-    if not USE_SQL_LLM:
-        sql = """
-        SELECT
-          ci.client_company_id,
-          ci.year::INT AS year,
-          regexp_replace(concat('', ci.quarter), '[^0-9]', '', 'g')::INT AS quarter,
-          (make_date(ci.year::INT, (regexp_replace(concat('', ci.quarter), '[^0-9]', '', 'g')::INT)*3, 1)
-           + INTERVAL '2 months')::DATE AS period_end_date,
-          ci.total_revenue,
-          ci.operating_income,
-          ci.ebitda,
-          ci.interest_expense
-        FROM clientincomestatements ci
-        WHERE ci.client_company_id = %(client_company_id)s
-        ORDER BY year, quarter;
-        """.strip()
-        params = {"client_company_id": state["client_company_id"]}
-        return {"sql": sql, "params": params}
+def node_sql_agent(state: State) -> State:
+    _trace_reset()
+    q = state.get("user_query", "")
+    ccid = state.get("client_company_id")
+    assert ccid not in (None, ""), "client_company_id is required"
 
-    out = sql_llm_agent(state["user_query"], state["client_company_id"])
-    params = out.get("params")
-    if not isinstance(params, dict) or not params:
-        params = {"client_company_id": state["client_company_id"]}
-    else:
-        params = dict(params)
-        params.setdefault("client_company_id", state["client_company_id"])
+    sql = generate_sql(q) if USE_SQL_LLM else fallback_sql()
+    if "%(client_company_id)s" not in sql or "%(client_name)s" in sql:
+        raise AssertionError("SQL must use %(client_company_id)s only (no client_name).")
 
-    return {
-        "sql": out.get("sql", ""),
-        "params": params,
-    }
+    try:
+        rows = safe_execute(sql, {"client_company_id": ccid})
+    except Exception as e:  # noqa: BLE001
+        if ENABLE_TRACE:
+            TRACE_LAST["sql_execute_error"] = str(e)
+        sql_fb = fallback_sql()
+        rows = safe_execute(sql_fb, {"client_company_id": ccid})
+        sql = sql_fb
+        TRACE_LAST["fallback_used"] = True
 
-
-
-def node_run_sql(state: State) -> State:
-    rows = run_safe_query(state["sql"], state.get("params") or {})
-    return {"rows": rows}
-
+    return {"sql": sql, "params": {"client_company_id": ccid}, "rows": rows, "trace": TRACE_LAST}
 
 
 def node_health(state: State) -> State:
-    rows = state.get("rows", [])
-    if not rows:
-        return {"health": {"status": "warning", "issues": ["No rows returned"], "notes": ""}}
-    h = health_llm_agent(rows)
-    return {"health": h}
-
+    ccid = state["client_company_id"]
+    health_rows = get_health_rows(ccid)
+    try:
+        health_json = health_agent_llm(health_rows)
+    except Exception as e:  # noqa: BLE001
+        health_json = {"error": str(e)}
+        if ENABLE_TRACE:
+            tr = state.get("trace", {})
+            tr["health_error"] = str(e)
+            state["trace"] = tr
+    state["health_rows"] = health_rows
+    state["health"] = health_json
+    return state
 
 
 def node_macro(state: State) -> State:
-    m = macro_llm_agent(state.get("user_query", ""), state.get("sector_name"))
-    return {"macro": m}
-
-
-
-def build_narratives(rows: List[Dict[str, Any]], macro: Dict[str, Any]) -> tuple[str, str]:
-    """
-    Lightweight deterministic narrative for "final_answer" and a shorter summary.
-    """
-    if not rows:
-        return ("No financial rows were returned for this client_company_id.", "No data.")
-    # Very simple: last period values + macro summary
-    last = rows[-1]
-    rev = last.get("total_revenue") or last.get("revenue")
-    op_inc = last.get("operating_income") or last.get("op_inc")
-    year = last.get("year")
-    qtr = last.get("quarter")
-    macro_sum = macro.get("summary", "")
-    full = (
-        f"In Q{qtr} {year}, revenue was {rev:,.1f} and operating income was {op_inc:,.1f}. "
-        f"Macro backdrop: {macro_sum or 'no specific macro commentary was retrieved.'}"
-    )
-    short = f"Q{qtr} {year}: revenue {rev:,.1f}, operating income {op_inc:,.1f}."
-    return full, short
+    mq = state.get("user_query", "")
+    ccid = state["client_company_id"]
+    sector_name = get_sector_name(ccid)
+    macro = fetch_macro_dynamic(mq, ccid, state.get("rows", []), state.get("health", {}), sector_name)
+    state["macro"] = macro
+    state["sector_name"] = sector_name
+    return state
 
 
 def node_strategy(state: State) -> State:
@@ -636,45 +877,32 @@ def node_strategy(state: State) -> State:
         state.get("macro", {}),
         state.get("sector_name"),
     )
-    return {
-        "strategy": {
-            "stance": strat.get("stance"),
-            "actions": (strat.get("actions") or [])[:5],
-            "signals": strat.get("signals", {}),
-        }
-    }
-
+    state["strategy"] = {"stance": strat.get("stance"), "actions": (strat.get("actions") or [])[:5], "signals": strat.get("signals", {})}
+    return state
 
 
 def node_narrative(state: State) -> State:
     narrative_en, narrative_short = build_narratives(state.get("rows", []), state.get("macro", {}))
-    return {
-        "final_answer": narrative_en,
-        "short_answer": narrative_short,
-    }
-
+    state["final_answer"] = narrative_en
+    state["short_answer"] = narrative_short
+    return state
 
 
 def node_finish(state: State) -> State:
-    return {"trace": get_trace()}
+    return {"trace": TRACE_LAST}
 
 
-
-# Build graph
 builder = StateGraph(State)
-builder.add_node("build_sql", node_build_sql)
-builder.add_node("run_sql", node_run_sql)
+builder.add_node("sql_agent", node_sql_agent)
 builder.add_node("health", node_health)
 builder.add_node("macro", node_macro)
 builder.add_node("strategy", node_strategy)
 builder.add_node("narrative", node_narrative)
 builder.add_node("finish", node_finish)
 
-builder.set_entry_point("build_sql")
-builder.add_edge("build_sql", "run_sql")
-builder.add_edge("run_sql", "health")
-builder.add_edge("run_sql", "macro")
-builder.add_edge("health", "strategy")
+builder.set_entry_point("sql_agent")
+builder.add_edge("sql_agent", "health")
+builder.add_edge("health", "macro")
 builder.add_edge("macro", "strategy")
 builder.add_edge("strategy", "narrative")
 builder.add_edge("narrative", "finish")
@@ -684,7 +912,7 @@ app = builder.compile()
 
 
 def ask(query: str, *, client_company_id: int | str):
-    reset_trace()
+    _trace_reset()
     init: State = {"user_query": query, "client_company_id": client_company_id}
     final: State = app.invoke(init)
     return final
@@ -695,10 +923,7 @@ def render_provenance(out: dict):
     print("=== Provenance ===")
     if tr.get("sql_agent"):
         sa = tr["sql_agent"]
-        print(
-            f"SQL Agent -> provider={sa.get('provider')} model={sa.get('model')} "
-            f"latency={sa.get('latency_ms')}ms fallback={tr.get('fallback_used')}"
-        )
+        print(f"SQL Agent -> provider={sa.get('provider')} model={sa.get('model')} latency={sa.get('latency_ms')}ms fallback={tr.get('fallback_used')}")
         if sa.get("rationale"):
             print("Rationale:", str(sa["rationale"])[:400])
         if sa.get("json_fragment"):
@@ -707,19 +932,23 @@ def render_provenance(out: dict):
         print(f"SQL Agent: (none)  fallback={tr.get('fallback_used')}")
     if tr.get("health"):
         h = tr["health"]
-        print(
-            f"Health LLM -> provider={h.get('provider')} model={h.get('model')} "
-            f"latency={h.get('latency_ms')}ms"
-        )
-    if tr.get("macro"):
-        m = tr["macro"]
-        print(
-            f"Macro LLM -> provider={m.get('provider')} model={m.get('model')} "
-            f"latency={m.get('latency_ms')}ms"
-        )
+        print(f"Health Agent -> provider={h.get('provider')} model={h.get('model')} latency={h.get('latency_ms')}ms")
+    elif tr.get("health_error"):
+        print("Health Agent -> error:", tr["health_error"])
+    else:
+        print("Health Agent: (none)")
+    if tr.get("macro_prompt"):
+        mp = tr["macro_prompt"]
+        print(f"Macro Prompt Agent -> provider={mp.get('provider')} model={mp.get('model')} latency={mp.get('latency_ms')}ms")
+        print("Macro query:", mp.get("query"), "| tags:", mp.get("tags"))
+    else:
+        print("Macro Prompt Agent: (none)")
     if tr.get("strategy_llm_primary"):
-        s = tr["strategy_llm_primary"]
-        print(
-            f"Strategy LLM -> provider={s.get('provider')} model={s.get('model')} "
-            f"latency={s.get('latency_ms')}ms"
-        )
+        st = tr["strategy_llm_primary"]
+        print(f"Strategy LLM (primary) -> provider={st.get('provider')} model={st.get('model')} latency={st.get('latency_ms')}ms")
+        if st.get("raw"):
+            print("Raw (trunc):", st["raw"][:300])
+    else:
+        print("Strategy LLM (primary): (none)")
+    if tr.get("strategy_user_prompt"):
+        print("Strategy saw user prompt:", tr["strategy_user_prompt"])
