@@ -247,6 +247,38 @@ def get_trace():
     return TRACE_LAST
 
 
+def safe_json_loads(raw: str):
+    try:
+        return json.loads(raw)
+    except Exception:
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return None
+    return None
+
+
+DEFAULT_SQL_QUERY = """
+SELECT
+  ci.client_company_id,
+  ci.year::INT AS year,
+  regexp_replace(concat('', ci.quarter), '[^0-9]', '', 'g')::INT AS quarter,
+  (
+    make_date(ci.year::INT, (regexp_replace(concat('', ci.quarter), '[^0-9]', '', 'g')::INT) * 3, 1)
+    + INTERVAL '2 months'
+  )::DATE AS period_end_date,
+  ci.total_revenue,
+  ci.operating_income,
+  ci.ebitda,
+  ci.interest_expense
+FROM clientincomestatements ci
+WHERE ci.client_company_id = %(client_company_id)s
+ORDER BY year, quarter;
+""".strip()
+
+
 def sql_llm_agent(user_query: str, client_company_id: int | str) -> Dict[str, Any]:
     """
     Use Anthropic to synthesize a safe SQL query for the client's data,
@@ -293,14 +325,16 @@ Output strictly as JSON with keys:
     raw = "".join(
         [b.text for b in resp.content if getattr(b, "type", None) == "text"]  # type: ignore[attr-defined]
     ).strip()
-    try:
-        data = json.loads(raw)
-    except Exception:
-        # Try to extract JSON block
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not m:
-            raise
-        data = json.loads(m.group(0))
+    data = safe_json_loads(raw)
+    fallback_used = False
+    if not data or not isinstance(data, dict) or not data.get("sql"):
+        fallback_used = True
+        data = {
+            "sql": DEFAULT_SQL_QUERY,
+            "params": {"client_company_id": client_company_id},
+            "rationale": "Fallback deterministic query used because LLM response could not be parsed.",
+        }
+    TRACE_LAST["fallback_used"] = fallback_used or TRACE_LAST.get("fallback_used")
     TRACE_LAST["sql_agent"] = {
         "provider": "anthropic",
         "model": resp.model,
@@ -418,13 +452,10 @@ Return JSON with:
     raw = "".join(
         [b.text for b in resp.content if getattr(b, "type", None) == "text"]  # type: ignore[attr-defined]
     ).strip()
-    try:
-        data = json.loads(raw)
-    except Exception:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not m:
-            raise
-        data = json.loads(m.group(0))
+    data = safe_json_loads(raw)
+    if not data or not isinstance(data, dict):
+        TRACE_LAST["fallback_used"] = True
+        data = {"summary": "No macro data available.", "drivers": []}
 
     TRACE_LAST["macro"] = {"provider": "anthropic", "model": resp.model, "latency_ms": dt, "raw": raw[:1000]}
     return data
@@ -470,13 +501,10 @@ Return JSON with:
     raw = "".join(
         [b.text for b in resp.content if getattr(b, "type", None) == "text"]  # type: ignore[attr-defined]
     ).strip()
-    try:
-        data = json.loads(raw)
-    except Exception:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not m:
-            raise
-        data = json.loads(m.group(0))
+    data = safe_json_loads(raw)
+    if not data or not isinstance(data, dict):
+        TRACE_LAST["fallback_used"] = True
+        data = {"status": "warning", "issues": ["Health JSON parse failure"], "notes": ""}
     TRACE_LAST["health"] = {"provider": "anthropic", "model": resp.model, "latency_ms": dt, "raw": raw[:1200]}
     return data
 
@@ -542,13 +570,14 @@ Return JSON with:
     raw = "".join(
         [b.text for b in resp.content if getattr(b, "type", None) == "text"]  # type: ignore[attr-defined]
     ).strip()
-    try:
-        data = json.loads(raw)
-    except Exception:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not m:
-            raise
-        data = json.loads(m.group(0))
+    data = safe_json_loads(raw)
+    if not data or not isinstance(data, dict):
+        TRACE_LAST["fallback_used"] = True
+        data = {
+            "stance": "Data pending",
+            "actions": ["Review data quality issues before making recommendations."],
+            "signals": {"financial": [], "operational": [], "macro": []},
+        }
     TRACE_LAST["strategy_llm_primary"] = {
         "provider": "anthropic",
         "model": resp.model,
@@ -582,21 +611,7 @@ class State(TypedDict, total=False):
 
 def node_build_sql(state: State) -> State:
     if not USE_SQL_LLM:
-        state["sql"] = """
-        SELECT
-          ci.client_company_id,
-          ci.year::INT AS year,
-          regexp_replace(concat('', ci.quarter), '[^0-9]', '', 'g')::INT AS quarter,
-          (make_date(ci.year::INT, (regexp_replace(concat('', ci.quarter), '[^0-9]', '', 'g')::INT)*3, 1)
-           + INTERVAL '2 months')::DATE AS period_end_date,
-          ci.total_revenue,
-          ci.operating_income,
-          ci.ebitda,
-          ci.interest_expense
-        FROM clientincomestatements ci
-        WHERE ci.client_company_id = %(client_company_id)s
-        ORDER BY year, quarter;
-        """.strip()
+        state["sql"] = DEFAULT_SQL_QUERY
         state["params"] = {"client_company_id": state["client_company_id"]}
         return state
 
