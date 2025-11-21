@@ -915,7 +915,10 @@ def ask(query: str, *, client_company_id: int | str):
     _trace_reset()
     init: State = {"user_query": query, "client_company_id": client_company_id}
     final: State = app.invoke(init)
-    return final
+    # Ensure everything is JSON-safe before FastAPI serializes the response. Without this,
+    # psycopg Decimals/dates or NumPy types can cause a 500 with a plain-text body, which
+    # the client then sees as a JSONDecodeError.
+    return make_json_safe(final)
 
 
 def render_provenance(out: dict):
