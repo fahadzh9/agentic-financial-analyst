@@ -915,7 +915,10 @@ def ask(query: str, *, client_company_id: int | str):
     _trace_reset()
     init: State = {"user_query": query, "client_company_id": client_company_id}
     final: State = app.invoke(init)
-    return final
+    # Ensure everything is JSON-safe before FastAPI serializes the response. Without this,
+    # psycopg Decimals/dates or NumPy types can cause a 500 with a plain-text body, which
+    # the client then sees as a JSONDecodeError.
+    return make_json_safe(final)
 
 
 def render_provenance(out: dict):
@@ -986,15 +989,19 @@ def diagnostics():
         llm_status = {"status": "error", "message": "ANTHROPIC_API_KEY is missing"}
     else:
         try:
-            client = Anthropic(api_key=api_key)
-            resp = client.messages.create(
-                model=model,
-                max_tokens=5,
-                messages=[{"role": "user", "content": "Reply with 'ok'"}],
-                system="You are a lightweight health check. Answer with 'ok'.",
-            )
-            reply = resp.content[0].text if resp.content else ""
-            llm_status = {"status": "ok", "model": model, "reply": reply}
+            # Use an explicit httpx client with trust_env=False to avoid
+            # environments that inject proxy settings incompatible with the
+            # Anthropic SDK (e.g., unexpected 'proxies' kwargs seen in Azure).
+            with httpx.Client(timeout=10.0, trust_env=False) as http_client:
+                client = Anthropic(api_key=api_key, http_client=http_client)
+                resp = client.messages.create(
+                    model=model,
+                    max_tokens=5,
+                    messages=[{"role": "user", "content": "Reply with 'ok'"}],
+                    system="You are a lightweight health check. Answer with 'ok'.",
+                )
+                reply = resp.content[0].text if resp.content else ""
+                llm_status = {"status": "ok", "model": model, "reply": reply}
         except Exception as e:  # noqa: BLE001
             llm_status = {"status": "error", "model": model, "message": str(e)}
 

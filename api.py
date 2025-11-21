@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Any, Dict
 
@@ -49,8 +50,18 @@ async def ask_endpoint(payload: AskRequest):
     try:
         out = ask(payload.prompt, client_company_id=payload.client_company_id)
     except Exception as e:
-        # You might want to add proper structured logging here.
-        raise HTTPException(status_code=500, detail=f"Graph invocation failed: {e}") from e
+        # Ensure the client always receives JSON, even when unexpected errors bubble up.
+        # Include the latest trace snapshot when available to help with debugging.
+        detail = {"detail": f"Graph invocation failed: {e}"}
+        try:
+            from financial_analyst_graph import TRACE_LAST, make_json_safe
 
-    # FastAPI can JSON-encode most built-in types (including date/datetime) automatically.
-    return out
+            detail["trace"] = make_json_safe(TRACE_LAST)
+        except Exception:
+            pass
+
+        return JSONResponse(status_code=500, content=detail)
+
+    # FastAPI can JSON-encode most built-in types (including date/datetime) automatically,
+    # but we already sanitized the graph output inside ask() for safety.
+    return JSONResponse(content=out)
